@@ -1,0 +1,334 @@
+import os
+import numpy as np
+import soundfile as sf
+import matplotlib
+matplotlib.use("Agg")          # headless – no display needed on Jetson
+import matplotlib.pyplot as plt
+
+try:
+    import sounddevice as sd
+    HAVE_SOUNDDEVICE = True
+except Exception:
+    HAVE_SOUNDDEVICE = False
+
+# Try numba for the hot loop – orders of magnitude faster
+try:
+    from numba import njit
+    HAVE_NUMBA = True
+    print("numba found – Kalman loop will be JIT-compiled.")
+except ImportError:
+    HAVE_NUMBA = False
+    print("numba not found – using optimised scalar loop (install numba for best speed).")
+
+# =========================================================
+# CONFIG
+# =========================================================
+INPUT_WAV  = "input.wav"
+OUTPUT_WAV = "recovered_audio.wav"
+PLOTS_DIR  = "plots"
+
+EBN0_DB      = 10
+PHASE_OFFSET = np.pi / 4
+FREQ_OFFSET  = 0.0001
+PILOT_LEN    = 100
+
+Q_PHASE = 1e-5
+Q_FREQ  = 1e-7
+R_SCALE = 5.0
+
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def normalize_audio(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float64)
+    peak = np.max(np.abs(x))
+    return x if peak == 0 else x / peak
+
+
+def play_audio(x: np.ndarray, fs: int, label: str):
+    print(label)
+    if HAVE_SOUNDDEVICE:
+        sd.play(x, fs)
+        sd.wait()
+    else:
+        print("  sounddevice not available, skipping playback.")
+
+
+def audio_to_bits(audio: np.ndarray):
+    audio_i16 = np.clip(np.round(audio * 32767.0), -32768, 32767).astype("<i2")
+    byte_view  = audio_i16.view(np.uint8)
+    bits       = np.unpackbits(byte_view, bitorder="big").astype(np.uint8)
+    return bits, audio_i16
+
+
+def bits_to_audio(bits: np.ndarray):
+    num_bits  = (len(bits) // 8) * 8
+    bits      = bits[:num_bits].astype(np.uint8)
+    byte_vals = np.packbits(bits, bitorder="big")
+    if len(byte_vals) % 2 != 0:
+        byte_vals = byte_vals[:-1]
+    audio_i16 = byte_vals.astype("<u1").view("<i2")
+    audio     = audio_i16.astype(np.float64) / 32767.0
+    return normalize_audio(audio)
+
+
+def bpsk_modulate(bits: np.ndarray) -> np.ndarray:
+    return 2.0 * bits.astype(np.float64) - 1.0
+
+
+def apply_channel(symbols, ebn0_db, freq_offset, phase_offset):
+    n     = np.arange(len(symbols), dtype=np.float64)
+    ebn0  = 10 ** (ebn0_db / 10.0)
+    sigma = np.sqrt(1.0 / (2.0 * ebn0))
+    tx    = symbols * np.exp(1j * (2.0 * np.pi * freq_offset * n + phase_offset))
+    noise = sigma * (np.random.randn(len(symbols)) + 1j * np.random.randn(len(symbols)))
+    return tx, tx + noise, sigma
+
+
+def estimate_frequency_bpsk(rx: np.ndarray) -> float:
+    rx_sq      = rx ** 2
+    phase_diff = np.angle(rx_sq[1:] * np.conj(rx_sq[:-1]))
+    return float(np.mean(phase_diff) / (4.0 * np.pi))
+
+
+def estimate_coarse_phase(rx_corr, symbols, pilot_len) -> float:
+    pilot_len = min(pilot_len, len(symbols))
+    return float(np.angle(np.mean(rx_corr[:pilot_len] * np.conj(symbols[:pilot_len]))))
+
+
+# =========================================================
+# KALMAN CORE – compiled with numba when available
+# =========================================================
+def _kalman_core_python(z_all, N, q_phase, q_freq, r_noise):
+    """
+    Pure-Python scalar Kalman loop.
+    State  x = [phase, freq_increment]
+    Model  F = [[1,1],[0,1]]   H = [1, 0]
+    Returns phi_est, omega_est arrays.
+    """
+    x0, x1 = 0.0, 0.0
+    P00, P01, P11 = 1.0, 0.0, 1.0
+
+    phi_est   = np.empty(N, dtype=np.float64)
+    omega_est = np.empty(N, dtype=np.float64)
+
+    TWO_PI = 2.0 * np.pi
+
+    for k in range(N):
+        # --- predict ---
+        x0_p  = x0 + x1
+        x1_p  = x1
+        # F P F^T  (upper triangle)
+        P00_p = P00 + P01 + P01 + P11 + q_phase
+        P01_p = P01 + P11
+        P11_p = P11 + q_freq
+
+        # --- gain ---
+        S  = P00_p + r_noise
+        K0 = P00_p / S
+        K1 = P01_p / S
+
+        # --- innovation (wrapped) ---
+        err = z_all[k] - x0_p
+        err = (err + np.pi) % TWO_PI - np.pi
+
+        # --- update state ---
+        x0 = x0_p + K0 * err
+        x1 = x1_p + K1 * err
+
+        # --- update covariance ---
+        P00 = (1.0 - K0) * P00_p
+        P01 = (1.0 - K0) * P01_p
+        P11 = P11_p - K1 * P01_p
+
+        phi_est[k]   = x0
+        omega_est[k] = x1
+
+    return phi_est, omega_est
+
+
+if HAVE_NUMBA:
+    # Wrap with njit for JIT compilation on first call
+    _kalman_core_numba = njit(cache=True)(_kalman_core_python.__wrapped__
+                                          if hasattr(_kalman_core_python, '__wrapped__')
+                                          else _kalman_core_python)
+    # Safer: just re-define with decorator
+    from numba import njit as _njit
+
+    @_njit(cache=True)
+    def _kalman_core(z_all, N, q_phase, q_freq, r_noise):
+        x0, x1 = 0.0, 0.0
+        P00, P01, P11 = 1.0, 0.0, 1.0
+
+        phi_est   = np.empty(N, np.float64)
+        omega_est = np.empty(N, np.float64)
+
+        for k in range(N):
+            x0_p  = x0 + x1
+            x1_p  = x1
+            P00_p = P00 + P01 + P01 + P11 + q_phase
+            P01_p = P01 + P11
+            P11_p = P11 + q_freq
+
+            S  = P00_p + r_noise
+            K0 = P00_p / S
+            K1 = P01_p / S
+
+            err = z_all[k] - x0_p
+            # wrap to [-pi, pi]
+            while err >  3.14159265358979:
+                err -= 6.28318530717959
+            while err < -3.14159265358979:
+                err += 6.28318530717959
+
+            x0 = x0_p + K0 * err
+            x1 = x1_p + K1 * err
+
+            P00 = (1.0 - K0) * P00_p
+            P01 = (1.0 - K0) * P01_p
+            P11 = P11_p - K1 * P01_p
+
+            phi_est[k]   = x0
+            omega_est[k] = x1
+
+        return phi_est, omega_est
+
+else:
+    _kalman_core = _kalman_core_python
+
+
+# =========================================================
+# HIGH-LEVEL KALMAN TRACKER
+# =========================================================
+def kalman_2state_track(rx_coarse: np.ndarray, symbols: np.ndarray,
+                        sigma: float, pilot_len: int):
+    N       = len(rx_coarse)
+    r_noise = float(R_SCALE * sigma ** 2)
+
+    # Pre-compute all phase measurements (symbols fully known in simulation)
+    sym_c = symbols.astype(np.complex128)
+    z_all = np.angle(rx_coarse * np.conj(sym_c)).astype(np.float64)
+
+    print(f"  Running Kalman filter over {N:,} samples …", flush=True)
+    phi_est, omega_est = _kalman_core(z_all, N, Q_PHASE, Q_FREQ, r_noise)
+
+    rx_corrected = rx_coarse * np.exp(-1j * phi_est)
+    decisions    = (np.real(rx_corrected) > 0).astype(np.uint8)
+
+    return decisions, rx_corrected, phi_est, omega_est
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    np.random.seed(0)
+
+    audio, Fs = sf.read(INPUT_WAV)
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)
+    audio = normalize_audio(audio)
+
+    play_audio(audio, Fs, "Playing original audio...")
+
+    bits    = audio_to_bits(audio)[0]
+    symbols = bpsk_modulate(bits)
+
+    tx, rx, sigma = apply_channel(symbols, EBN0_DB, FREQ_OFFSET, PHASE_OFFSET)
+
+    # ---- Stage 1: Frequency estimation ----
+    freq_est = estimate_frequency_bpsk(rx)
+    print(f"Estimated frequency offset = {freq_est:.6e}")
+
+    n = np.arange(len(symbols), dtype=np.float64)
+    rx_freq_corrected = rx * np.exp(-1j * 2.0 * np.pi * freq_est * n)
+
+    # ---- Stage 2: Coarse phase estimation ----
+    phi0     = estimate_coarse_phase(rx_freq_corrected, symbols, PILOT_LEN)
+    print(f"Coarse phase estimate      = {phi0:.6f}")
+    rx_coarse = rx_freq_corrected * np.exp(-1j * phi0)
+
+    ber_coarse = np.mean(bits != (np.real(rx_coarse) > 0).astype(np.uint8))
+    print(f"BER after coarse only      = {ber_coarse:.4f}")
+
+    # ---- Stage 3: 2-state Kalman filter ----
+    decisions, rx_corrected, phi_est, omega_est = kalman_2state_track(
+        rx_coarse, symbols, sigma, PILOT_LEN)
+
+    # Phase-ambiguity fix
+    pilot_len  = min(PILOT_LEN, len(bits))
+    pilot_bits = bits[:pilot_len]
+    if np.mean(pilot_bits != decisions[:pilot_len]) > 0.5:
+        decisions    = 1 - decisions
+        rx_corrected = -rx_corrected
+        print("Phase ambiguity corrected")
+
+    ber = np.sum(bits != decisions[:len(bits)]) / len(bits)
+    print(f"BER after 2-state Kalman   = {ber:.6f}")
+
+    # ---- Bits -> audio ----
+    audio_rx = bits_to_audio(decisions[:(len(decisions) // 8) * 8])
+    play_audio(audio_rx, Fs, "Playing recovered audio...")
+    sf.write(OUTPUT_WAV, audio_rx, Fs)
+    print(f"Recovered audio saved to {OUTPUT_WAV}")
+
+    # =====================================================
+    # PLOTS
+    # =====================================================
+    def savefig(path):
+        plt.tight_layout()
+        plt.savefig(os.path.join(PLOTS_DIR, path), dpi=150)
+        plt.close()
+
+    plt.figure(figsize=(10, 6))
+    plt.subplot(2, 1, 1); plt.plot(audio);    plt.title("Original Audio");   plt.grid(True)
+    plt.subplot(2, 1, 2); plt.plot(audio_rx); plt.title("Recovered Audio");  plt.grid(True)
+    savefig("audio_waveforms.png")
+
+    plt.figure(figsize=(10, 4))
+    plt.stem(bits[:200], basefmt=" ")
+    plt.title("Original Bits (first 200)"); plt.grid(True)
+    savefig("original_bits.png")
+
+    plt.figure(figsize=(10, 4))
+    plt.stem(decisions[:200], basefmt=" ")
+    plt.title("Detected Bits (first 200)"); plt.grid(True)
+    savefig("detected_bits.png")
+
+    plt.figure(figsize=(12, 8))
+    for i, (sig, title) in enumerate([
+        (np.real(tx[:2000]),               "Transmitted (Real)"),
+        (np.real(rx[:2000]),               "Received (Real)"),
+        (np.real(rx_freq_corrected[:2000]),"After Freq Correction (Real)"),
+        (np.real(rx_corrected[:2000]),     "After Kalman Correction (Real)"),
+    ]):
+        plt.subplot(4, 1, i + 1); plt.plot(sig); plt.title(title); plt.grid(True)
+    savefig("signal_waveforms.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(phi_est); plt.title("Kalman Phase Estimate"); plt.grid(True)
+    savefig("phase_estimate.png")
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(omega_est); plt.title("Kalman Frequency Estimate"); plt.grid(True)
+    savefig("frequency_estimate.png")
+
+    for sig, fname, title in [
+        (rx[:2000],               "constellation_before.png",        "Before Correction"),
+        (rx_freq_corrected[:2000],"constellation_after_freq.png",    "After Freq Correction"),
+        (rx_corrected[:2000],     "constellation_after_kalman.png",  "After Kalman Correction"),
+    ]:
+        plt.figure(figsize=(6, 6))
+        plt.scatter(np.real(sig), np.imag(sig), s=4)
+        plt.title(title); plt.xlabel("In-phase"); plt.ylabel("Quadrature")
+        plt.grid(True); plt.axis("equal")
+        savefig(fname)
+
+    print("All plots saved to:", PLOTS_DIR)
+
+
+if __name__ == "__main__":
+    main()
